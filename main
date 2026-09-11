@@ -1,0 +1,233 @@
+function main(workbook: ExcelScript.Workbook, emailBody: string): string {
+    // Unicode horizontal-space class (nbsp, en/em spaces, ideographic space, etc.)
+    const USP = "\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000";
+    let text = emailBody;
+
+    // 1. Strip HTML
+    if (text.indexOf("<") >= 0 && text.indexOf(">") >= 0) {
+        text = text.replace(/<style[\s\S]*?<\/style>/gi, "");
+        text = text.replace(/<script[\s\S]*?<\/script>/gi, "");
+        text = text.replace(/<head[\s\S]*?<\/head>/gi, "");
+        text = text.replace(/<!--[\s\S]*?-->/g, "");
+        text = text.replace(/<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, "$2 [$1]");
+        text = text.replace(/<br\s*\/?>/gi, "\n");
+        text = text.replace(/<\/(p|div|tr|li|h[1-6])>/gi, "\n");
+        text = text.replace(/<[^>]+>/g, "");
+        text = text.replace(/&nbsp;/g, " ");
+        text = text.replace(/&amp;/g, "&");
+        text = text.replace(/&lt;/g, "<");
+        text = text.replace(/&gt;/g, ">");
+        text = text.replace(/&quot;/g, "\"");
+        text = text.replace(/&#39;/g, "'");
+    }
+
+    // 2. Strip invisible padding characters
+    text = text.replace(/[\u00AD\u034F\u200B-\u200F\u2060\uFEFF]/g, "");
+
+    // 3. Strip Safe Links wrapper boilerplate
+    text = text.replace(/https:\/\/[a-z0-9-]+\.safelinks\.protection\.outlook\.com\/\?url=/gi, "");
+    text = text.replace(/&data=[^&\s\])"']*&reserved=0/gi, "");
+    text = text.replace(/&data=[^&\s\])"']*/gi, "");
+
+    // 4. Manual percent-decode
+    text = text.replace(/%[0-9A-Fa-f]{2}/g, function (m: string): string {
+        return String.fromCharCode(parseInt(m.substring(1), 16));
+    });
+
+    // 5. Unwrap ESP base64 tracking URLs
+    const trackerRe = /https?:\/\/[^\s\])"']*?\/(?:click|c|e\/c)\/([A-Za-z0-9_-]{20,})(?:\/[A-Za-z0-9_-]+)?/gi;
+    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const replacements: { from: string; to: string }[] = [];
+    let trackerMatch: RegExpExecArray | null = trackerRe.exec(text);
+    while (trackerMatch !== null) {
+        const fullMatch: string = trackerMatch[0];
+        const b64: string = trackerMatch[1];
+        let s = b64.replace(/-/g, "+").replace(/_/g, "/");
+        while (s.length % 4) s += "=";
+        let decoded = "";
+        let buffer = 0;
+        let bits = 0;
+        for (let i = 0; i < s.length; i++) {
+            const c = s.charAt(i);
+            if (c === "=") break;
+            const v = chars.indexOf(c);
+            if (v < 0) continue;
+            buffer = (buffer << 6) | v;
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                decoded += String.fromCharCode((buffer >> bits) & 0xff);
+            }
+        }
+        const hrefIdx = decoded.indexOf("\"href\"");
+        let realUrl = "";
+        if (hrefIdx >= 0) {
+            const colonIdx = decoded.indexOf(":", hrefIdx);
+            const firstQuote = decoded.indexOf("\"", colonIdx + 1);
+            const secondQuote = decoded.indexOf("\"", firstQuote + 1);
+            if (firstQuote >= 0 && secondQuote > firstQuote) {
+                realUrl = decoded.substring(firstQuote + 1, secondQuote);
+                realUrl = realUrl.replace(/\\u0026/g, "&").replace(/\\\//g, "/");
+            }
+        }
+        if (realUrl.length > 0 && realUrl.indexOf("http") === 0) {
+            replacements.push({ from: fullMatch, to: realUrl });
+        }
+        trackerMatch = trackerRe.exec(text);
+    }
+    for (let i = 0; i < replacements.length; i++) {
+        text = text.split(replacements[i].from).join(replacements[i].to);
+    }
+
+    // 6. Clean residual wrapper artifacts
+    text = text.replace(/&reserved=0/gi, "");
+
+    // 7. Strip tracking query params
+    text = text.replace(
+        /([?&])(utm_[^=&\s]+|mc_[^=&\s]+|_hs[a-z]*|fbclid|gclid|mkt_tok|ref_src|ref_url|originalsrc|sdata)=[^&\s\])"']*/gi,
+        ""
+    );
+    text = text.replace(/\?&/g, "?");
+    text = text.replace(/[?&]([\s\])"'])/g, "$1");
+
+    // 8. Drop image placeholder lines
+    text = text.replace(/^\s*\[https?:\/\/[^\]\s]*\.(png|jpe?g|gif|webp|svg|ico)(\?[^\]]*)?\]\s*$/gim, "");
+    text = text.replace(/^\s*\[https?:\/\/(media|cdn|img|images?|static|assets|s3|storage)\.[^\]\s]+\]\s*$/gim, "");
+
+    // 8b. Strip preheader teaser lines — a line padded with a long run of
+    //     whitespace (incl. unicode spaces). Real content never has 20+ in a row.
+    text = text.replace(new RegExp("^[^\\n]*[ \\t" + USP + "]{20,}[^\\n]*$", "gm"), "");
+
+    // 8c. Drop standalone navigation-chrome lines anywhere (e.g. a
+    //     top-of-email "View in browser"), optionally trailed by a [url].
+    const navChrome = /^(view (this (e-?mail|message) )?in (your )?browser|manage (your )?(e-?mail )?(subscription|preferences)|web ?version)( \[[^\]]*\])?$/i;
+    {
+        const ls = text.split("\n");
+        const kept: string[] = [];
+        for (let i = 0; i < ls.length; i++) {
+            if (navChrome.test(ls[i].trim())) continue;
+            kept.push(ls[i]);
+        }
+        text = kept.join("\n");
+    }
+
+    // 9. Dedupe consecutive bracketed URL lines
+    const lines = text.split("\n");
+    const out: string[] = [];
+    let lastUrl = "";
+    for (let i = 0; i < lines.length; i++) {
+        const trimmed = lines[i].trim();
+        const m = trimmed.match(/^\[(https?:\/\/[^\]]+)\]$/);
+        if (m !== null) {
+            if (m[1] === lastUrl) continue;
+            lastUrl = m[1];
+        } else if (trimmed.length > 0) {
+            lastUrl = "";
+        }
+        out.push(lines[i]);
+    }
+    text = out.join("\n");
+
+    // 10. Trim footer.
+    //     ANCHOR on a footer-only phrase (never seen in body copy), cut from that
+    //     block to the END (so trailing junk like "Advertise with Us" after the
+    //     unsubscribe line goes too), then extend UPWARD over the contiguous run
+    //     of weak footer blocks leading into it. © and "all rights reserved" are
+    //     NOT anchors (they appear in mid-body photo credits) — only weak.
+    const anchorSignal: RegExp[] = [
+        /unsubscrib/i,
+        /this (e-?mail|message) was (sent|intended) (to|for)\b/i,
+        /you('re| are) receiving this/i,
+        /you received this (e-?mail|message)/i,
+        /no longer (wish|want) to receive/i,
+        /update your (e-?mail )?(preferences|profile)/i,
+    ];
+    const weakSignal: RegExp[] = [
+        /manage (your )?(e-?mail )?(subscription|preferences)/i,
+        /all rights reserved/i,
+        /©|&copy;/,
+        /our mailing address/i,
+        /add us to your address book/i,
+        /view (this (e-?mail|message) )?in (your )?browser/i,
+        /privacy policy/i,
+        /did you enjoy this (news ?letter|e-?mail)/i,
+        /(join|sign up for) our (mailing|e-?mail) list/i,
+        /connect with us/i,
+        /follow us\b/i,
+        /industry downloads/i,
+        /more papers\b/i,
+        /advertise with us/i,
+    ];
+    {
+        const blocks = text.split(/\n{2,}/);
+        let anchor = -1;
+        for (let i = 0; i < blocks.length; i++) {
+            for (let j = 0; j < anchorSignal.length; j++) {
+                if (anchorSignal[j].test(blocks[i])) { anchor = i; break; }
+            }
+            if (anchor >= 0) break;
+        }
+        if (anchor >= 0) {
+            let start = anchor;
+            for (let i = anchor - 1; i >= 0; i--) {
+                const b = blocks[i].trim();
+                if (b.length === 0) { start = i; continue; }
+                let weak = false;
+                for (let j = 0; j < weakSignal.length; j++) {
+                    if (weakSignal[j].test(b)) { weak = true; break; }
+                }
+                if (weak) { start = i; continue; }
+                break;
+            }
+            text = blocks.slice(0, start).join("\n\n");
+        }
+    }
+
+    // 11. Drop sponsored / promoted blocks. Block-based: a bare "Sponsored" /
+    //     "Advertisement" badge on its own line removes the whole ad block, and
+    //     phrase labels (e.g. "content provided by") match anywhere in the block.
+    const adFirstLine: RegExp[] = [
+        /^sponsored\b/i,
+        /^advertisement\b/i,
+        /^promoted\b/i,
+        /^paid (content|post|partnership|advertisement)\b/i,
+    ];
+    const adAnywhere: RegExp[] = [
+        /sponsored content/i,
+        /sponsor content/i,
+        /content provided by/i,
+        /presented by/i,
+        /brought to you by/i,
+        /in partnership with/i,
+        /featured sponsor/i,
+    ];
+    {
+        const blocks = text.split(/\n{2,}/);
+        const keep: string[] = [];
+        for (let i = 0; i < blocks.length; i++) {
+            const b = blocks[i].trim();
+            const firstLine = b.split("\n")[0].trim();
+            let isAd = false;
+            for (let j = 0; j < adFirstLine.length; j++) {
+                if (adFirstLine[j].test(firstLine)) { isAd = true; break; }
+            }
+            if (!isAd) {
+                for (let j = 0; j < adAnywhere.length; j++) {
+                    if (adAnywhere[j].test(b)) { isAd = true; break; }
+                }
+            }
+            if (isAd) continue;
+            keep.push(blocks[i]);
+        }
+        text = keep.join("\n\n");
+    }
+
+    // 12. Whitespace cleanup (incl. unicode horizontal spaces)
+    text = text.replace(new RegExp("[" + USP + "]", "g"), " ");
+    text = text.replace(/[ \t]+/g, " ");
+    text = text.replace(/\n[ \t]+/g, "\n");
+    text = text.replace(/\n{3,}/g, "\n\n");
+    text = text.trim();
+
+    return text;
+}
